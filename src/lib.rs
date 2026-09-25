@@ -7,6 +7,14 @@ mod error;
 mod firm;
 mod info;
 
+// ── TrangorgeOS integration ─────────────────────────────────────────
+// `host` is the only boundary through which the driver touches the system
+// (MMIO / DMA / PCI config / ACPI tables, all brokered by `ds-manager`).
+// `driver` implements the `ds-fw-iommu` device contract on top of the
+// hardware core below.
+pub mod driver;
+pub mod host;
+
 pub mod arch;
 
 #[allow(deprecated)]
