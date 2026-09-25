@@ -1,14 +1,18 @@
-//! IOMMU 驱动实现：把硬件核心接到 TrangorgeOS 设备类契约上。
+//! The IOMMU driver implementation: wires the hardware core into the
+//! TrangorgeOS device-class contract.
 //!
-//! [`IommuDriver`] 实现 `ds_fw_iommu::IommuDevice`，也就是 `ds-manager` 通过
-//! `DsCmd::Iommu*` 能看到的那台“设备”。它做三件事：
+//! [`IommuDriver`] implements `ds_fw_iommu::IommuDevice`, i.e. it is the "device"
+//! that `ds-manager` sees through `DsCmd::Iommu*`. It does three things:
 //!
-//! 1. **发现**：通过 [`Platform::acpi_table`] 向内核要 DMAR/IVRS 表，用硬件
-//!    核心自带的解析器枚举 remapping unit；
-//! 2. **状态**：维护域、绑定、映射、保留区的簿记，并在每次改动后触发失效；
-//! 3. **上报**：把固件保留区和故障翻译成线路载荷。
+//! 1. **Discovery**: asks the kernel for the DMAR/IVRS table via
+//!    [`Platform::acpi_table`] and enumerates remapping units with the parser
+//!    that already ships in the hardware core;
+//! 2. **State**: keeps the bookkeeping for domains, bindings, mappings and
+//!    reservations, and triggers an invalidation after every change;
+//! 3. **Reporting**: turns firmware reservations and faults into wire payloads.
 //!
-//! 所有宿主资源都经由 [`Platform`]，驱动里不出现任何硬编码物理地址。
+//! Every host resource goes through [`Platform`]; no hardcoded physical address
+//! appears anywhere in the driver.
 
 use ds_fw_iommu::{
     ControllerId, DomainId, IoRange, IommuDevice, RequesterId,
@@ -25,38 +29,40 @@ use kapi_abi::{
 
 use crate::host::{DMA_CONTIGUOUS, MappedRegion, Platform};
 
-/// 同时支持的控制器数量上限。
+/// Maximum number of controllers supported at once.
 pub const MAX_CONTROLLERS: usize = 8;
-/// 并存的地址空间域数量上限。
+/// Maximum number of live address-space domains.
 pub const MAX_DOMAINS: usize = 16;
-/// 记录在案的映射条目上限。
+/// Maximum number of tracked mapping entries.
 pub const MAX_MAPPINGS: usize = 128;
-/// 固件保留区数量上限。
+/// Maximum number of firmware reserved regions.
 pub const MAX_RESERVED: usize = 16;
-/// 缓存的故障条数上限。
+/// Maximum number of cached faults.
 pub const MAX_FAULTS: usize = 16;
-/// 记录在案的 requester 绑定数量上限。
+/// Maximum number of tracked requester bindings.
 pub const MAX_BINDINGS: usize = 64;
 
-/// 一个已发现的控制器。
+/// One discovered controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControllerEntry {
     pub info: IommuControllerInfo,
-    /// 寄存器窗口；由 `ds-manager` 映射，驱动只借用不拥有。
+    /// Register window; mapped by `ds-manager`, borrowed - never owned - by
+    /// the driver.
     pub registers: Option<MappedRegion>,
 }
 
-/// 一个地址空间域的簿记条目。
+/// Bookkeeping entry for one address-space domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainEntry {
     pub id: DomainId,
     pub controller: ControllerId,
-    /// 域的二级页表根，由 `ds-manager` 分配的 DMA 内存承载。
+    /// Root of the domain's second-level page table, held in DMA memory
+    /// allocated by `ds-manager`.
     pub page_table: Option<MappedRegion>,
     pub live_mappings: u32,
 }
 
-/// 一条 IOVA 映射的簿记条目。
+/// Bookkeeping entry for one IOVA mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappingEntry {
     pub domain: DomainId,
@@ -65,7 +71,7 @@ pub struct MappingEntry {
     pub permission: IommuPermission,
 }
 
-/// 一个 requester → 域 的绑定。
+/// One requester -> domain binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BindingEntry {
     pub requester: WireRequester,
@@ -89,15 +95,16 @@ const EMPTY_FAULT: IommuFaultPayload = IommuFaultPayload {
     faulting_phys: 0,
 };
 
-/// 两个 IOVA 区间是否重叠。
+/// Whether two IOVA ranges overlap.
 fn overlaps(a: IoRange, b: IoRange) -> bool {
     a.iova < b.iova.saturating_add(b.size) && b.iova < a.iova.saturating_add(a.size)
 }
 
-/// IOMMU 设备实现。
+/// The IOMMU device implementation.
 ///
-/// `P` 是宿主平台：生产环境用 [`crate::host::SyscallPlatform`]，测试用
-/// `MockPlatform`，因此下面的簿记逻辑可以在没有内核的环境下真正执行。
+/// `P` is the host platform: [`crate::host::SyscallPlatform`] in production and
+/// `MockPlatform` in tests, so all the bookkeeping below can really execute
+/// with no kernel present.
 pub struct IommuDriver<P> {
     platform: P,
     controllers: [Option<ControllerEntry>; MAX_CONTROLLERS],
@@ -108,12 +115,12 @@ pub struct IommuDriver<P> {
     reserved_len: usize,
     faults: [IommuFaultPayload; MAX_FAULTS],
     fault_len: usize,
-    /// 已触发的失效次数（诊断用）。
+    /// Number of invalidations triggered (diagnostics only).
     invalidations: u32,
 }
 
 impl<P: Platform> IommuDriver<P> {
-    /// 创建一个尚未探测的驱动实例。
+    /// Create a driver instance that has not probed yet.
     pub fn new(platform: P) -> Self {
         Self {
             platform,
@@ -129,17 +136,17 @@ impl<P: Platform> IommuDriver<P> {
         }
     }
 
-    /// 宿主平台引用。
+    /// Borrow the host platform.
     pub fn platform(&self) -> &P {
         &self.platform
     }
 
-    /// 已触发的失效次数。
+    /// Number of invalidations triggered.
     pub fn invalidation_count(&self) -> u32 {
         self.invalidations
     }
 
-    /// 控制器簿记。
+    /// Controller bookkeeping.
     pub fn controller(&self, index: usize) -> Option<&ControllerEntry> {
         match self.controllers.get(index) {
             Some(Some(entry)) => Some(entry),
@@ -147,17 +154,17 @@ impl<P: Platform> IommuDriver<P> {
         }
     }
 
-    /// 域簿记。
+    /// Domain bookkeeping.
     pub fn domain(&self, id: DomainId) -> Option<&DomainEntry> {
         self.domains.iter().flatten().find(|d| d.id == id)
     }
 
-    /// 某 requester 当前的绑定。
+    /// The binding a requester currently has.
     pub fn binding_of(&self, requester: WireRequester) -> Option<&BindingEntry> {
         self.binding_slot(requester).and_then(|i| self.bindings[i].as_ref())
     }
 
-    /// 登记一次固件声明的保留区。
+    /// Record one firmware-declared reserved region.
     pub fn add_reserved_region(&mut self, region: IommuReservedRegionPayload) {
         if self.reserved_len < MAX_RESERVED {
             self.reserved[self.reserved_len] = region;
@@ -165,14 +172,14 @@ impl<P: Platform> IommuDriver<P> {
         }
     }
 
-    /// 登记一个控制器，返回它的索引。
+    /// Register a controller and return its index.
     pub fn add_controller(&mut self, info: IommuControllerInfo) -> Option<ControllerId> {
         let slot = self.controllers.iter().position(|c| c.is_none())?;
         self.controllers[slot] = Some(ControllerEntry { info, registers: None });
         Some(ControllerId(slot as u32))
     }
 
-    /// 记下控制器的寄存器窗口。
+    /// Note down a controller's register window.
     pub fn attach_registers(&mut self, controller: ControllerId, region: MappedRegion) {
         if let Some(entry) = self
             .controllers
@@ -183,7 +190,7 @@ impl<P: Platform> IommuDriver<P> {
         }
     }
 
-    /// 上报一次故障（超过 `MAX_FAULTS` 时覆盖最旧的一条）。
+    /// Report one fault (overwrites the oldest once `MAX_FAULTS` is reached).
     pub fn report_fault(&mut self, fault: IommuFaultPayload) {
         if self.fault_len < MAX_FAULTS {
             self.faults[self.fault_len] = fault;
@@ -204,7 +211,7 @@ impl<P: Platform> IommuDriver<P> {
         self.domains.iter().position(|d| d.is_some_and(|d| d.id == id))
     }
 
-    /// 为 `range` 登记一条映射。
+    /// Record one mapping covering `range`.
     fn record_mapping(&mut self, entry: MappingEntry) -> Result<(), DsError> {
         if entry.range.iova & 0xFFF != 0 || entry.range.size & 0xFFF != 0 {
             return Err(DsError::InvalidMessage);
@@ -231,7 +238,7 @@ impl<P: Platform> IommuDriver<P> {
         Ok(())
     }
 
-    /// 撤销一条登记中的映射。
+    /// Forget a recorded mapping.
     fn forget_mapping(&mut self, domain: DomainId, range: IoRange) -> bool {
         let Some(slot) = self
             .mappings
@@ -250,14 +257,16 @@ impl<P: Platform> IommuDriver<P> {
     }
 }
 
-/// x86_64 专用的 ACPI 探测：向内核索取 DMAR 表并枚举 remapping unit。
+/// x86_64-specific ACPI probe: fetch the DMAR table and enumerate remapping
+/// units.
 #[cfg(target_arch = "x86_64")]
 impl<P: Platform> IommuDriver<P> {
-    /// 读取 DMAR 表并登记控制器与固件保留区。
+    /// Read the DMAR table and register controllers and firmware reservations.
     ///
-    /// 平台没有 DMAR 表（老平台、无 IOMMU 的机器）不算错误——调用方通过
-    /// [`IommuDevice::controller_count`] 看到 0 个控制器即可。只有表存在但
-    /// 格式损坏才返回 `Err`。
+    /// A platform without a DMAR table (old machines, no IOMMU at all) is not
+    /// an error: the caller simply sees 0 controllers through
+    /// [`IommuDevice::controller_count`]. Only a table that exists but is
+    /// malformed returns `Err`.
     pub fn probe_acpi(&mut self) -> Result<(), DsError> {
         use crate::arch::x86_64::intel::dmar::DmarTable;
         use kore_memory::Mapping;
@@ -265,13 +274,14 @@ impl<P: Platform> IommuDriver<P> {
 
         let view = match self.platform.acpi_table(*b"DMAR", 0) {
             Ok(view) => view,
-            // 没有 IOMMU 的机器是正常情况。
+            // A machine without an IOMMU is normal, not an error.
             Err(DsError::DeviceNotFound) => return Ok(()),
             Err(error) => return Err(error),
         };
 
-        // 把内核给的映射包装成 `kore_memory::Mapping`，这样硬件核心自带的
-        // 解析器可以直接用——不必在驱动里再写一份 DMAR 解析器。
+        // Wrap the kernel-provided mapping in a `kore_memory::Mapping` so the
+        // parser that already ships in the hardware core can be reused - the
+        // driver does not grow a second DMAR parser.
         let base = VirtAddr::from_usize(view.virt as usize);
         let end = VirtAddr::from_usize(view.virt as usize + view.len as usize);
         let mapping = Mapping::<
@@ -284,8 +294,8 @@ impl<P: Platform> IommuDriver<P> {
             Default::default(),
         );
 
-        // SAFETY: `view` 由 `ds-manager` 映射并保证在本次调用期间可读；
-        // `mapping` 精确覆盖该区间。
+        // SAFETY: `view` was mapped by `ds-manager` and stays readable for the
+        // duration of this call, and `mapping` covers exactly that range.
         let table = unsafe { DmarTable::from_mapping(&mapping) }
             .map_err(|_| DsError::InvalidMessage)?;
 
@@ -313,7 +323,7 @@ impl<P: Platform> IommuDriver<P> {
             })
             .map_err(|_| DsError::InvalidMessage)?;
 
-        // RMRR：固件声明必须原样保留的 DMA 区间。
+        // RMRR: DMA ranges the firmware requires us to preserve verbatim.
         table
             .for_each_rmrr(|region| {
                 let base = region.memory.start.as_usize() as u64;
@@ -321,7 +331,7 @@ impl<P: Platform> IommuDriver<P> {
                 if end > base {
                     self.add_reserved_region(IommuReservedRegionPayload {
                         base,
-                        // 载荷里的 `limit` 是闭区间上界。
+                        // `limit` in the payload is an inclusive upper bound.
                         limit: end - 1,
                         requester: RequesterId::NONE.raw(),
                         _pad: 0,
@@ -359,7 +369,7 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
         if self.controller(controller.index() as usize).is_none() {
             return Err(DsError::DeviceNotFound);
         }
-        // hint 优先；否则取第一个空闲 id。
+        // Prefer the hint, otherwise take the first free id.
         let id = if hint != 0 && hint != u32::MAX {
             DomainId(hint)
         } else {
@@ -383,7 +393,8 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
             .position(|d| d.is_none())
             .ok_or(DsError::OutOfMemory)?;
 
-        // 域的二级页表必须是设备可见、连续的内存——硬件要直接遍历它。
+        // A domain's second-level page table must be device-visible and
+        // contiguous, because the hardware walks it directly.
         let page_table = self
             .platform
             .alloc_dma(0x1000, DMA_CONTIGUOUS | crate::host::DMA_COHERENT)?;
@@ -400,11 +411,12 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
     fn domain_destroy(&mut self, domain: DomainId) -> Result<(), DsError> {
         let index = self.domain_index(domain).ok_or(DsError::DeviceNotFound)?;
 
-        // 还有活跃映射的域不能销毁：否则设备会突然开始踩野指针。
+        // A domain with live mappings must not be destroyed, or the device
+        // would suddenly start dereferencing wild pointers.
         if self.domains[index].is_some_and(|d| d.live_mappings != 0) {
             return Err(DsError::DeviceBusy);
         }
-        // 域被销毁后绑定它的 requester 必须一起解绑。
+        // Requesters bound to a destroyed domain must be unbound with it.
         for slot in self.bindings.iter_mut() {
             if let Some(binding) = slot {
                 if binding.domain == domain {
@@ -434,7 +446,8 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
         if !requester.is_valid() {
             return Err(DsError::InvalidMessage);
         }
-        // 确认 requester 真实存在——避免把不存在的设备写进上下文表。
+        // Confirm the requester really exists, so we never program a
+        // non-existent device into the context table.
         self.platform
             .read_pci(requester.raw(), 0x00)
             .map_err(|_| DsError::DeviceNotFound)?;
@@ -451,7 +464,8 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
                 self.bindings[slot] = Some(binding);
             }
         }
-        // 绑定改变了 requester 的翻译上下文，必须失效它的 TLB。
+        // Binding changes the requester's translation context, so its TLB
+        // must be invalidated.
         self.invalidations += 1;
         Ok(())
     }
@@ -472,7 +486,8 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
         if self.domain_index(domain).is_none() {
             return Err(DsError::DeviceNotFound);
         }
-        // 请求方指定物理页时用它，否则向内核申请新的 DMA 内存。
+        // Use the caller's physical page when it supplied one, otherwise ask
+        // the kernel for fresh DMA memory.
         let phys_base = if request.flags.contains(kapi_abi::payloads::iommu::IommuMapFlags::FIXED)
         {
             request.phys_base
@@ -489,7 +504,8 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
             permission: request.permission,
         })?;
 
-        // 新映射必须让设备的 IOTLB 失效，否则设备还会命中旧翻译。
+        // A new mapping must invalidate the device's IOTLB, otherwise the
+        // device keeps hitting the stale translation.
         self.invalidations += 1;
         Ok(phys_base)
     }
@@ -511,8 +527,9 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
         &mut self,
         request: &IommuInvalidatePayload,
     ) -> Result<IommuInvalidateScope, DsError> {
-        // 作用域必须落在已知的控制器/域上，否则等于给了调用方一个
-        // “可以失效任意硬件状态”的能力。
+        // The scope must land on a known controller/domain, otherwise the
+        // caller would effectively be able to invalidate arbitrary hardware
+        // state.
         if self.controller(request.controller as usize).is_none() {
             return Err(DsError::DeviceNotFound);
         }
@@ -529,8 +546,9 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
             return Err(DsError::DeviceNotFound);
         }
         self.invalidations += 1;
-        // 簿记层总是能完成请求的作用域；真实硬件可能退化为更宽的作用域，
-        // 那由 `arch` 层的失效器上报。
+        // The bookkeeping layer can always honour the requested scope; real
+        // hardware may have to fall back to a wider one, which the `arch`-layer
+        // invalidator reports.
         Ok(request.scope)
     }
 
@@ -539,8 +557,8 @@ impl<P: Platform> IommuDevice for IommuDriver<P> {
     }
 
     fn reserved_region(&self, index: usize, out: &mut IommuReservedRegionPayload) -> bool {
-        // Uwaga: tablica jest stałej wielkości, więc `get()` sam w sobie nie
-        // wystarcza — trzeba sprawdzić, ile pozycji faktycznie wypełniono.
+        // Note: the array has a fixed size, so `get()` alone is not enough -
+        // we also have to check how many slots are actually filled.
         match self.reserved.get(index) {
             Some(region) if index < self.reserved_len => {
                 *out = *region;
@@ -571,7 +589,7 @@ mod tests {
     use crate::host::mock::MockPlatform;
     use kapi_abi::payloads::iommu::{IommuKind, IommuMapFlags, IommuStage};
 
-    /// 造一台“已经发现一个控制器”的驱动。
+    /// A driver that has already discovered one controller.
     fn bare_driver() -> IommuDriver<MockPlatform> {
         let mut driver = IommuDriver::new(MockPlatform::new(0, 0));
         driver.add_controller(IommuControllerInfo {
@@ -615,14 +633,14 @@ mod tests {
         assert!(driver.controller_info(0, &mut info));
         assert_eq!(info.kind, IommuKind::IntelVtd);
         assert_eq!(info.mmio_base, 0xfed0_0000);
-        assert!(!driver.controller_info(1, &mut info), "poza zakresem");
+        assert!(!driver.controller_info(1, &mut info), "out of range");
     }
 
     #[test]
     fn a_machine_without_an_iommu_reports_zero_controllers() {
-        // Brak tabeli DMAR to normalna sytuacja, nie błąd.
+        // A missing DMAR table is a normal situation, not an error.
         let mut driver = IommuDriver::new(MockPlatform::new(0, 0));
-        driver.probe_acpi().expect("brak tabeli DMAR nie jest błędem");
+        driver.probe_acpi().expect("a missing DMAR table is not an error");
         assert_eq!(driver.controller_count(), 0);
     }
 
@@ -633,12 +651,12 @@ mod tests {
         assert!(domain.is_valid());
         assert!(driver.domain(domain).expect("domain").page_table.is_some());
 
-        // Ten sam hint nie może zostać przydzielony dwa razy.
+        // The same hint must not be handed out twice.
         assert_eq!(
             driver.domain_create(ControllerId(0), domain.raw()).unwrap_err(),
             DsError::DeviceBusy
         );
-        // Nieznany kontroler -> brak urządzenia.
+        // Unknown controller -> no such device.
         assert_eq!(
             driver.domain_create(ControllerId(9), 0).unwrap_err(),
             DsError::DeviceNotFound
@@ -673,12 +691,12 @@ mod tests {
 
 
 
-        // Wchodzi w zakres istniejącej mapy.
+        // This one lands inside an existing mapping.
         assert_eq!(
             driver.map(&map_request(domain, 0x2000, 0x1000)).unwrap_err(),
             DsError::DeviceBusy
         );
-        // Rozwiązanie zakresu jest dozwolone.
+        // Disjoint ranges are fine.
         assert!(driver.map(&map_request(domain, 0x3000, 0x1000)).is_ok());
     }
 
@@ -687,17 +705,17 @@ mod tests {
         let mut driver = bare_driver();
         let domain = driver.domain_create(ControllerId(0), 0).expect("create");
 
-        // IOVA nie wyrównane do strony.
+        // IOVA is not page-aligned.
         assert_eq!(
             driver.map(&map_request(domain, 0x1800, 0x1000)).unwrap_err(),
             DsError::InvalidMessage
         );
-        // Nieistniejąca domena.
+        // Non-existent domain.
         assert_eq!(
             driver.map(&map_request(DomainId(99), 0x1000, 0x1000)).unwrap_err(),
             DsError::DeviceNotFound
         );
-        // Rozmiar niepełnej strony.
+        // Size is not a whole number of pages.
         assert_eq!(
             driver.map(&map_request(domain, 0x1000, 0x1800)).unwrap_err(),
             DsError::InvalidMessage
@@ -729,7 +747,7 @@ mod tests {
                 faulting_phys: 0,
             });
         }
-        // Pierścień jest ograniczony — nie rośnie w nieskończoność.
+        // The ring is bounded - it does not grow without limit.
         assert_eq!(driver.pending_faults(), MAX_FAULTS);
 
         let mut fault = EMPTY_FAULT;
@@ -777,19 +795,19 @@ mod tests {
             iova: 0,
         };
 
-        // Nieznany kontroler.
+        // Unknown controller.
         assert_eq!(
             driver.invalidate(&invalid(IommuInvalidateScope::Global, 7, domain)).unwrap_err(),
             DsError::DeviceNotFound
         );
-        // Zakres domeny na nieistniejącej domenie.
+        // Domain scope aimed at a domain that does not exist.
         assert_eq!(
             driver
                 .invalidate(&invalid(IommuInvalidateScope::Domain, 0, DomainId(42)))
                 .unwrap_err(),
             DsError::DeviceNotFound
         );
-        // Poprawny zakres przechodzi.
+        // A valid scope is accepted.
         assert_eq!(
             driver.invalidate(&invalid(IommuInvalidateScope::Domain, 0, domain)).expect("ok"),
             IommuInvalidateScope::Domain
@@ -801,7 +819,7 @@ mod tests {
         let mut driver = bare_driver();
         let domain = driver.domain_create(ControllerId(0), 0).expect("create");
 
-        // Brak wpisu w przestrzeni konfiguracji => urządzenie nie istnieje.
+        // No config-space entry => the device does not exist.
         assert_eq!(
             driver
                 .bind(&IommuBindPayload {
@@ -813,7 +831,7 @@ mod tests {
                 .unwrap_err(),
             DsError::DeviceNotFound
         );
-        // Nieprawidłowy requester.
+        // Malformed requester.
         assert_eq!(
             driver
                 .bind(&IommuBindPayload {
@@ -825,7 +843,7 @@ mod tests {
                 .unwrap_err(),
             DsError::InvalidMessage
         );
-        // Nieistniejąca domena.
+        // Non-existent domain.
         assert_eq!(
             driver
                 .bind(&IommuBindPayload {

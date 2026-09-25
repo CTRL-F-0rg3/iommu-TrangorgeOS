@@ -13,11 +13,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "iommu-driver"
 path = "src/main.rs"
+# The driver binary is `no_main` and provides its own `#[panic_handler]`, so
+# Cargo must not try to build a test harness for it. Unit tests live in the
+# library target instead.
+test = false
+bench = false
 
 [dependencies]
 # ── TrangorgeOS driver-space infrastructure (lib/) ──────────────────
-# Wyłącznie `lib/` — sterownik nie może zależeć od `crates/` (reguła
-# jednokierunkowej zależności z Workspace.md).
+# `lib/` only - a driver must never depend on `crates/` (the one-way
+# dependency rule from Workspace.md).
 kapi-abi = { path = "../../lib/kapi-abi" }
 kapi-syscall = { path = "../../lib/kapi-syscall" }
 ds-log = { path = "../../lib/ds-log" }

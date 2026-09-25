@@ -1,28 +1,33 @@
-//! TrangorgeOS 宿主资源层。
+//! The TrangorgeOS host resource layer.
 //!
-//! 这是驱动与系统其余部分之间**唯一**的边界。工作区规则禁止驱动硬编码物理
-//! 地址或直接访问配置空间，因此 MMIO 映射、DMA 内存、PCI 配置空间与 ACPI 表
-//! 一律通过 [`Platform`] 抽象向 `ds-manager` 申请。
+//! This is the **only** boundary between the driver and the rest of the system.
+//! Workspace rules forbid a driver from hardcoding physical addresses or
+//! poking configuration space directly, so MMIO mappings, DMA memory, PCI config
+//! space and ACPI tables are all requested from `ds-manager` through the
+//! [`Platform`] abstraction.
 //!
-//! 把传输层抽象成 trait 有两个直接好处：
+//! Abstracting the transport behind a trait buys two things directly:
 //!
-//! 1. 驱动逻辑可以在没有内核的环境下做单元测试（见本模块的 `MockPlatform`），
-//!    测试真的跑得起来，而不只是做类型检查；
-//! 2. 将来换传输方式（共享内存 ring、ioctl）不影响 `driver.rs` 的逻辑。
+//! 1. The driver logic can be unit tested with no kernel present (see
+//!    `MockPlatform` in this module), so the tests actually run instead of merely
+//!    type-checking;
+//! 2. Swapping the transport later (shared-memory ring, ioctl) leaves
+//!    `driver.rs` untouched.
 //!
-//! 真实实现是 [`SyscallPlatform`]，它把每个操作翻译成一个 `DsCmd`。
+//! The real implementation is [`SyscallPlatform`], which turns each operation
+//! into a single `DsCmd`.
 
 use kapi_abi::{
     DsCmd, DsError, DsMsg,
     payloads::sys::{AcpiTableRequest, acpi_table_reply},
 };
 
-/// DMA 分配属性。位定义与 `ds-mem` 的 `DmaFlags` 一致。
+/// DMA allocation flags. Bit layout matches `ds-mem`'s `DmaFlags`.
 pub const DMA_COHERENT: u32 = 1 << 0;
 pub const DMA_HIGH_MEM: u32 = 1 << 1;
 pub const DMA_CONTIGUOUS: u32 = 1 << 2;
 
-/// 一段由内核映射给驱动使用的物理区间。
+/// A physical range the kernel mapped for the driver to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappedRegion {
     pub phys: u64,
@@ -41,19 +46,19 @@ impl MappedRegion {
         self.size != 0
     }
 
-    /// 区间的虚拟基址。
+    /// The range's virtual base.
     ///
     /// # Safety
     ///
-    /// 调用方必须保证该映射仍然存活且可写；映射只能由创建它的
-    /// [`Platform`] 实现释放。
+    /// The caller must keep the mapping alive and writable; only the
+    /// [`Platform`] implementation that created it may release it.
     #[inline]
     pub unsafe fn as_mut_ptr(self) -> *mut u8 {
         self.virt as *mut u8
     }
 }
 
-/// 内核映射过来的一张 ACPI SDT 表。
+/// One ACPI SDT the kernel mapped on our behalf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcpiView {
     pub virt: u64,
@@ -61,12 +66,12 @@ pub struct AcpiView {
 }
 
 impl AcpiView {
-    /// 表的只读字节视图。
+    /// A read-only view of the table bytes.
     ///
     /// # Safety
     ///
-    /// 必须保证该映射在返回切片的生命周期内有效。`ds-manager` 在驱动回复
-    /// 释放请求之前会一直持有映射。
+    /// The mapping must stay valid for the lifetime of the returned slice.
+    /// `ds-manager` holds it until the driver releases the request.
     #[inline]
     pub unsafe fn bytes(&self) -> &[u8] {
         if self.len == 0 {
@@ -76,34 +81,34 @@ impl AcpiView {
     }
 }
 
-/// 驱动需要的全部宿主能力。
+/// Every host capability the driver needs.
 ///
-/// 刻意保持窄接口：只暴露 IOMMU bring-up 真正需要的操作，避免驱动获得超出
-/// 职责范围的能力。
+/// Deliberately kept narrow: it exposes only what IOMMU bring-up really needs,
+/// so the driver cannot acquire capabilities outside its remit.
 pub trait Platform {
-    /// 映射设备寄存器窗口。
+    /// Map a device register window.
     fn map_mmio(&self, phys: u64, size: u64) -> Result<MappedRegion, DsError>;
 
-    /// 解除 [`Self::map_mmio`] 的映射。
+    /// Release a mapping taken by [`Self::map_mmio`].
     fn unmap_mmio(&self, region: MappedRegion) -> Result<(), DsError>;
 
-    /// 分配设备可见（DMA）内存。
+    /// Allocate device-visible (DMA) memory.
     fn alloc_dma(&self, size: u64, flags: u32) -> Result<MappedRegion, DsError>;
 
-    /// 释放 [`Self::alloc_dma`] 的内存。
+    /// Release memory taken by [`Self::alloc_dma`].
     fn free_dma(&self, region: MappedRegion) -> Result<(), DsError>;
 
-    /// 读 PCI 配置空间（offset & 0xFC）。
+    /// Read PCI config space (offset & 0xFC).
     fn read_pci(&self, requester: u32, offset: u32) -> Result<u32, DsError>;
 
-    /// 写 PCI 配置空间（offset & 0xFC）。
+    /// Write PCI config space (offset & 0xFC).
     fn write_pci(&self, requester: u32, offset: u32, value: u32) -> Result<(), DsError>;
 
-    /// 按四字符签名取一张 ACPI 表（例如 `b"DMAR"`）。
+    /// Fetch one ACPI table by four-character signature (e.g. `b"DMAR"`).
     fn acpi_table(&self, signature: [u8; 4], instance: u32) -> Result<AcpiView, DsError>;
 }
 
-/// 通过 `kapi-syscall` 与 `ds-manager` 通信的真实平台实现。
+/// The real platform implementation, talking to `ds-manager` through `kapi-syscall`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SyscallPlatform;
 
@@ -113,7 +118,7 @@ impl SyscallPlatform {
         Self
     }
 
-    /// 把一次 syscall 的状态码翻译成 `DsError`。
+    /// Translate one syscall's status code into a [`DsError`].
     #[inline]
     fn check(reply: DsMsg) -> Result<DsMsg, DsError> {
         if reply.is_ok() {
@@ -191,7 +196,7 @@ impl Platform for SyscallPlatform {
             0,
         ))?;
 
-        // 约定：arg0 = 虚拟基址，arg1 = 长度（见 acpi_table_reply）。
+        // Convention: arg0 = virtual base, arg1 = length (see acpi_table_reply).
         let virt = reply.arg(acpi_table_reply::VIRT_BASE);
         let len = reply.arg(acpi_table_reply::LENGTH);
         if virt == 0 || len == 0 {
@@ -204,13 +209,14 @@ impl Platform for SyscallPlatform {
 
 #[cfg(test)]
 pub(crate) mod mock {
-    //! Testowa implementacja `Platform` — udostępniona dla testów `driver`.
+    //! A test `Platform` implementation, shared with the `driver` tests.
 
     use super::{AcpiView, DsError, MappedRegion, Platform, DMA_CONTIGUOUS};
     use core::cell::RefCell;
 
-    /// 一个不碰内核的假平台：记录请求，把映射落在测试自己准备的缓冲上。
-    /// 这样 `driver.rs` 的发现/映射逻辑可以被真正执行。
+    /// A fake platform that never touches a kernel: it records requests and
+    /// hands out mappings from buffers the test owns. This lets the discovery
+    /// and mapping logic in `driver.rs` actually execute.
     pub struct MockPlatform {
         next_virt: RefCell<u64>,
         pub pci: RefCell<Vec<(u32, u32, u32)>>,
@@ -239,7 +245,7 @@ pub(crate) mod mock {
             base
         }
 
-        /// 让下一次平台调用失败，用于验证错误路径。
+        /// Make the next platform call fail, to exercise error paths.
         pub fn fail_next(&self, error: DsError) {
             *self.fail_next.borrow_mut() = Some(error);
         }
@@ -272,7 +278,7 @@ pub(crate) mod mock {
             if size == 0 || size & 0xFFF != 0 {
                 return Err(DsError::InvalidMessage);
             }
-            // Strony IOMMU czyta sprzętowo, więc muszą być ciągłe.
+            // The IOMMU walks these pages in hardware, so they must be contiguous.
             assert_ne!(
                 flags & DMA_CONTIGUOUS,
                 0,
@@ -335,7 +341,7 @@ mod tests {
         let b = platform.alloc_dma(0x1000, DMA_CONTIGUOUS).expect("alloc");
 
         assert_eq!(a.phys, 0x8000_0000);
-        assert_ne!(a.virt, b.virt, "każde mapowanie musi dostać osobne okno");
+        assert_ne!(a.virt, b.virt, "every mapping must get its own window");
         assert!(a.is_valid());
         platform.free_dma(a).expect("free");
     }
@@ -359,7 +365,7 @@ mod tests {
             platform.alloc_dma(0x1000, DMA_CONTIGUOUS).unwrap_err(),
             DsError::PermissionDenied
         );
-        // 注入的失败只发生一次
+        // the injected failure happens only once
         assert!(platform.alloc_dma(0x1000, DMA_CONTIGUOUS).is_ok());
     }
 
@@ -368,7 +374,7 @@ mod tests {
         let platform = MockPlatform::new(0, 0);
         platform.write_pci(0x0000_0100, 0x04, 0x0000_0007).expect("write");
         assert_eq!(platform.read_pci(0x0000_0100, 0x04).expect("read"), 0x07);
-        // 未对齐 offset 会被掩到 DWORD 边界
+        // an unaligned offset is masked down to the DWORD boundary
         assert_eq!(platform.read_pci(0x0000_0100, 0x06).expect("read"), 0x07);
         assert_eq!(
             platform.read_pci(0xdead_beef, 0x00).unwrap_err(),

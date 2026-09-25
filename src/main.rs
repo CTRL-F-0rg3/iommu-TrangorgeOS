@@ -1,14 +1,16 @@
-//! IOMMU 驱动入口。
+//! IOMMU driver entry point.
 //!
-//! `ds-manager` 加载驱动后调用 [`driver_main`]。流程：
+//! `ds-manager` calls [`driver_main`] after loading the driver. The flow is:
 //!
-//! 1. 用 `SyscallPlatform` 建立与系统的唯一通道（MMIO / DMA / PCI / ACPI）；
-//! 2. 探测固件里的 IOMMU 单元（x86_64 = DMAR 表）；
-//! 3. 用 `IommuService` 把驱动包装成 `ds-manager` 能调度的设备，并只授予读类
-//!    能力——建域 / 绑定 / 映射这类写类能力必须由 `ds-manager` 显式授予；
-//! 4. 进入服务循环，按 IPC 消息驱动硬件。
+//! 1. establish the single channel to the system via `SyscallPlatform`
+//!    (MMIO / DMA / PCI / ACPI);
+//! 2. probe the IOMMU units described by firmware (on x86_64: the DMAR table);
+//! 3. wrap the driver in an `IommuService` so `ds-manager` can schedule it as a
+//!    device, granting only read capabilities - domain creation, binding and
+//!    mapping must be granted explicitly by `ds-manager`;
+//! 4. enter the service loop and drive the hardware from IPC messages.
 //!
-//! 全程不触碰任何未申请的物理地址。
+//! No unrequested physical address is ever touched.
 
 #![no_std]
 #![no_main]
@@ -27,7 +29,8 @@ use iommu_driver::{
 };
 use kapi_abi::CapId;
 
-/// 驱动实例（`IommuService` 的所有方）。放在静态区里，让服务循环能常驻。
+/// The driver instance (owner of the `IommuService`). It lives in static
+/// storage so the service loop can hold on to it for good.
 struct Runtime {
     service: IommuService<IommuDriver<SyscallPlatform>>,
 }
@@ -36,9 +39,10 @@ static mut RUNTIME: Option<Runtime> = None;
 static mut REQUEST_BUF: [u8; MAX_PAYLOAD_LEN] = [0u8; MAX_PAYLOAD_LEN];
 static mut REPLY_BUF: [u8; MAX_PAYLOAD_LEN] = [0u8; MAX_PAYLOAD_LEN];
 
-/// `ds-manager` 加载驱动时调用的入口。
+/// The entry point `ds-manager` calls after loading the driver.
 ///
-/// 符号名与工作区内其他驱动（`vgpu` 的 `driver_main`）保持一致。
+/// The symbol name matches the other workspace drivers (`vgpu`'s
+/// `driver_main`).
 #[unsafe(no_mangle)]
 pub extern "C" fn driver_main() -> ! {
     ds_info!("IOMMU: driver starting");
@@ -52,8 +56,9 @@ pub extern "C" fn driver_main() -> ! {
 
     ds_info!("IOMMU: discovered {} controller(s)", device.controller_count());
 
-    // 读类能力随注册一起给出；写类能力等 ds-manager 显式授予，
-    // 这样即使出现越权调用也改不了硬件状态。
+    // Read capabilities come with registration; the mutating ones wait for an
+    // explicit grant from ds-manager, so even an over-privileged call cannot
+    // change hardware state.
     let mut service = IommuService::new(device);
     service.grant(CapId::IOMMU_ENUMERATE);
 
@@ -65,7 +70,7 @@ pub extern "C" fn driver_main() -> ! {
     serve()
 }
 
-/// 服务循环：取请求 -> 分发 -> 回回复。
+/// The service loop: take a request -> dispatch -> send the reply.
 fn serve() -> ! {
     loop {
         let Some(msg) = kapi_syscall::sys_try_recv() else {
@@ -76,14 +81,14 @@ fn serve() -> ! {
     }
 }
 
-/// 处理一条请求并把回复推回上行环。
+/// Handle one request and push the reply onto the uplink ring.
 fn handle(msg: kapi_abi::DsMsg) {
     let reply = unsafe {
         let Some(runtime) = (*(&raw mut RUNTIME)).as_mut() else {
             return;
         };
-        // 请求载荷由调用方放在 msg.arg0；先拷进本地缓冲，
-        // 框架层因此完全不需要裸指针。
+        // The caller put the request payload at msg.arg0; copy it into a local
+        // buffer first so the framework layer needs no raw pointers at all.
         let request_buf = &mut *(&raw mut REQUEST_BUF);
         copy_in(msg, request_buf);
         let request = ds_fw_iommu::Request::new(msg, &request_buf[..]);
@@ -103,12 +108,13 @@ fn handle(msg: kapi_abi::DsMsg) {
     }
 }
 
-/// 把 `msg.arg0` 指向的请求载荷拷进本地缓冲。
+/// Copy the request payload that `msg.arg0` points at into a local buffer.
 ///
 /// # Safety
 ///
-/// 调用方保证 `msg.arg1` 字节在 `ds-manager` 侧的缓冲里有效；本函数只做
-/// 边界检查，不解引用超过声明长度的内存。
+/// The caller guarantees that `msg.arg1` bytes are valid in the
+/// `ds-manager`-side buffer; this function only bounds-checks and never
+/// dereferences more than the declared length.
 unsafe fn copy_in(msg: kapi_abi::DsMsg, scratch: &mut [u8]) {
     let len = (msg.arg1 as usize).min(scratch.len());
     if len == 0 || msg.arg0 == 0 {
@@ -118,7 +124,8 @@ unsafe fn copy_in(msg: kapi_abi::DsMsg, scratch: &mut [u8]) {
     scratch[..len].copy_from_slice(unsafe { core::slice::from_raw_parts(src, len) });
 }
 
-/// 停机：出错时不能静默返回，否则 `ds-manager` 会一直等这个驱动。
+/// Halt: on failure we must not return silently, or `ds-manager` would keep
+/// waiting for this driver forever.
 fn halt() -> ! {
     loop {
         kapi_syscall::sys_yield();
